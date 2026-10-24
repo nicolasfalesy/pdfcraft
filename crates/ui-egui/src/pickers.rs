@@ -120,6 +120,9 @@ pub struct Pickers {
     /// until the pick's closure starts.
     showing: Arc<AtomicBool>,
     done: Arc<Mutex<Vec<Picked>>>,
+    /// Tests: the next worker "fails to start", as when the OS is out of threads.
+    #[cfg(test)]
+    fail_spawn: bool,
 }
 
 /// Clears `showing` if the worker ends without queueing a pick (it panicked).
@@ -155,12 +158,12 @@ impl Pickers {
 
     /// Wait for `pick` on a worker thread and queue its result for the next frame. On macOS
     /// `pick` must already have shown the picker (rfd starts the panel when the future is
-    /// created, on the main thread). Returns false when the worker couldn't start.
-    fn spawn<F>(&self, target: Option<PickTarget>, ctx: Option<egui::Context>, pick: F, then: Then) -> bool
+    /// created, on the main thread). When the worker couldn't start, `then` comes back.
+    fn spawn<F>(&self, target: Option<PickTarget>, ctx: Option<egui::Context>, pick: F, then: Then) -> Result<(), Option<Then>>
     where
         F: Future<Output = Vec<PathBuf>> + Send + 'static,
     {
-        self.spawn_worker(target, ctx, pick, then, pdfcraft_platform::file_dialog_probe::why_empty).is_some()
+        self.spawn_worker(target, ctx, pick, then, pdfcraft_platform::file_dialog_probe::why_empty).map(drop)
     }
 
     /// [`Self::spawn`], returning the worker so tests can wait for it instead of polling.
@@ -172,24 +175,34 @@ impl Pickers {
         pick: F,
         then: Then,
         why_empty: fn() -> Option<Problem>,
-    ) -> Option<std::thread::JoinHandle<()>>
+    ) -> Result<std::thread::JoinHandle<()>, Option<Then>>
     where
         F: Future<Output = Vec<PathBuf>> + Send + 'static,
     {
         let showing = Showing { flag: Some(self.showing.clone()), ctx: ctx.clone() };
         let done = self.done.clone();
-        std::thread::Builder::new()
-            .name("file-picker".into())
-            .spawn(move || {
-                let paths = pollster::block_on(pick);
-                let why = if paths.is_empty() { why_empty() } else { None };
+        // `then` waits in a slot the thread empties, so a thread that never starts doesn't take
+        // it down with the closure: the caller gets it back and can keep the request.
+        let slot = Arc::new(Mutex::new(Some(then)));
+        let in_thread = slot.clone();
+        let work = move || {
+            let paths = pollster::block_on(pick);
+            let why = if paths.is_empty() { why_empty() } else { None };
+            let then = in_thread.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(then) = then {
                 done.lock().unwrap_or_else(PoisonError::into_inner).push(Picked { target, paths, then, why });
-                showing.hand_over();
-                if let Some(ctx) = ctx {
-                    ctx.request_repaint();
-                }
-            })
-            .ok()
+            }
+            showing.hand_over();
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        };
+        #[cfg(test)]
+        if self.fail_spawn {
+            drop(work);
+            return Err(slot.lock().unwrap_or_else(PoisonError::into_inner).take());
+        }
+        std::thread::Builder::new().name("file-picker".into()).spawn(work).map_err(|_| slot.lock().unwrap_or_else(PoisonError::into_inner).take())
     }
 
     /// Queue a pick that is already known (tests and automation). Like a real pick, it keeps
@@ -247,9 +260,15 @@ impl PdfCraftApp {
 
     /// [`Self::ask`] once `showing` is claimed for it.
     fn show_picker(&mut self, ask: Ask, target: Option<PickTarget>, then: Then) -> bool {
+        self.start_picker(ask, target, then).is_ok()
+    }
+
+    /// Show the panel. When its worker can't start, the user is told and the request comes back
+    /// (`None` only if the worker had already taken `then`, which a worker that never ran hasn't).
+    fn start_picker(&mut self, ask: Ask, target: Option<PickTarget>, then: Then) -> Result<(), Option<Box<Waiting>>> {
         if let Some(paths) = self.pick_override.clone() {
             self.pickers.deliver(target, paths.into_iter().map(PathBuf::from).collect(), then);
-            return true;
+            return Ok(());
         }
         self.pickers.shown = Some(ask.clone());
         // On macOS creating the future shows the panel; it must happen here, on the main thread.
@@ -278,12 +297,12 @@ impl PdfCraftApp {
                 )
             }
         };
-        if !started {
-            self.pickers.shown = None;
+        started.map_err(|then| {
+            let ask = self.pickers.shown.take();
             self.pickers.showing.store(false, Ordering::SeqCst);
             self.notify_tr("Couldn't show the file picker. Please try again.");
-        }
-        started
+            ask.zip(then).map(|(ask, then)| Box::new(Waiting { ask, target, then }))
+        })
     }
 
     /// [`Self::ask`] for one path: `then` gets the first chosen path.
@@ -349,14 +368,16 @@ impl PdfCraftApp {
     /// The user's answer to [`Self::picker_failed`]: show the same dialog again, its result
     /// going where it was going, or drop what asked.
     pub(crate) fn resolve_picker_failed(&mut self, retry: bool) {
-        let Some(Failed { ask, target, then, .. }) = self.pickers.failed.take() else { return };
+        let Some(Failed { ask, target, then, why }) = self.pickers.failed.take() else { return };
         if !retry {
             return;
         }
         if self.pickers.showing.swap(true, Ordering::SeqCst) {
             self.pickers.waiting.push_front(Waiting { ask, target, then });
-        } else {
-            self.show_picker(ask, target, then);
+        } else if let Err(Some(unstarted)) = self.start_picker(ask, target, then) {
+            let Waiting { ask, target, then } = *unstarted;
+            // The retry couldn't start (the user was told): keep asking what to do with it.
+            self.pickers.failed = Some(Failed { ask, target, then, why });
         }
     }
 }
@@ -375,7 +396,7 @@ mod tests {
         let mut app = PdfCraftApp::new();
         app.pickers.showing.store(true, Ordering::SeqCst);
         let got = Arc::new(Mutex::new(Vec::new()));
-        let worker = app.pickers.spawn_worker(None, None, async { vec![PathBuf::from("a.pdf")] }, record(&got), || None).expect("worker starts");
+        let worker = app.pickers.spawn_worker(None, None, async { vec![PathBuf::from("a.pdf")] }, record(&got), || None).ok().expect("worker starts");
         // Wait for the worker itself: polling with a deadline was flaky on loaded CI runners.
         assert!(worker.join().is_ok());
         assert!(app.pickers.showing.load(Ordering::SeqCst), "the queued pick still owns the flag");
@@ -403,7 +424,7 @@ mod tests {
             panic!("picker failed")
         }
         let got = Arc::new(Mutex::new(Vec::new()));
-        let worker = pickers.spawn_worker(None, Some(ctx.clone()), async { fail() }, record(&got), || None).expect("worker starts");
+        let worker = pickers.spawn_worker(None, Some(ctx.clone()), async { fail() }, record(&got), || None).ok().expect("worker starts");
         // join returns once the panic has unwound and the drop guard has run.
         assert!(worker.join().is_err());
         assert!(!pickers.showing.load(Ordering::SeqCst));
@@ -420,7 +441,7 @@ mod tests {
     fn answer_empty(app: &mut PdfCraftApp, then: Then, why_empty: fn() -> Option<Problem>) {
         app.pickers.showing.store(true, Ordering::SeqCst);
         app.pickers.shown = Some(Ask::Save(rfd::AsyncFileDialog::new().set_file_name("reduced.pdf")));
-        let worker = app.pickers.spawn_worker(None, None, async { Vec::new() }, then, why_empty).expect("worker starts");
+        let worker = app.pickers.spawn_worker(None, None, async { Vec::new() }, then, why_empty).ok().expect("worker starts");
         assert!(worker.join().is_ok());
         app.process_picked();
     }
@@ -481,6 +502,81 @@ mod tests {
         app.process_picked();
         let order: Vec<_> = got.lock().unwrap().iter().map(|(who, _)| *who).collect();
         assert_eq!(order, ["first", "second"]);
+    }
+
+    #[test]
+    fn a_retry_that_cannot_start_keeps_what_asked() {
+        let mut app = PdfCraftApp::new();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        answer_empty(&mut app, record(&got), backend_down);
+        // The OS has no thread for the picker: Try again can't start, and the prompt stays.
+        app.pickers.fail_spawn = true;
+        app.resolve_picker_failed(true);
+        assert_eq!(app.picker_failed(), backend_down().as_ref(), "still asking what to do with it");
+        assert!(!app.pickers.showing.load(Ordering::SeqCst), "the question doesn't hold the picker");
+        assert_eq!(Arc::strong_count(&got), 2, "the kept closure holds its work");
+        // Threads are back: the next Try again shows the same panel and the kept work uses it.
+        app.pickers.fail_spawn = false;
+        app.pick_override = Some(vec!["reduced.pdf".into()]);
+        app.resolve_picker_failed(true);
+        assert_eq!(app.picker_failed(), None);
+        app.process_picked();
+        assert_eq!(*got.lock().unwrap(), vec![PathBuf::from("reduced.pdf")]);
+    }
+
+    /// The prompt covers the page, so a stamp can't be placed and the wheel can't zoom under it
+    /// (#4162 review). egui's modal layer already keeps both off the page, with or without
+    /// `modal_open`; this holds that. The control runs the same gestures with no prompt.
+    #[test]
+    fn the_picker_prompt_leaves_the_page_alone() {
+        use egui_kittest::Harness;
+
+        let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
+            let mut app = PdfCraftApp::new();
+            app.set_option("language", "en").unwrap();
+            app.open_bytes("form.pdf", None, include_bytes!("../tests/data/form.pdf").to_vec()).unwrap();
+            app.set_option("zoom", "150").unwrap();
+            app.quick_tool = crate::QuickTool::Stamp(pdfcraft_engine::StampKind::DynApproved);
+            app
+        });
+        h.run_steps(6);
+        let page = h.state().views[0].page_screen_rect(0).expect("page on screen");
+        let at = page.min + egui::vec2(page.width() * 0.5, page.height() * 0.85);
+        let stamps = |app: &PdfCraftApp| app.session.get(app.views[0].id).unwrap().info.annotations.iter().filter(|a| a.subtype == "Stamp").count();
+        let ask = Ask::Save(rfd::AsyncFileDialog::new().set_file_name("reduced.pdf"));
+        let why = Problem::BackendDown(vec!["xdg-desktop-portal-gtk".into()]);
+        h.state_mut().pickers.failed = Some(Failed { ask, target: None, then: Box::new(|_, _| {}), why });
+        h.run_steps(2);
+        let zoom = h.state().views[0].zoom;
+        h.hover_at(at);
+        h.run_steps(1);
+        h.event(egui::Event::Zoom(1.5));
+        h.run_steps(3);
+        h.drag_at(at);
+        h.run_steps(1);
+        h.drop_at(at);
+        h.run_steps(3);
+        assert_eq!(h.state().views[0].zoom, zoom, "the prompt owns the wheel");
+        assert_eq!(stamps(h.state()), 0, "the prompt owns the click");
+        assert!(h.state().picker_failed().is_some());
+
+        // Control: answered, the page takes both again.
+        h.state_mut().resolve_picker_failed(false);
+        h.run_steps(2);
+        h.hover_at(at);
+        h.run_steps(1);
+        h.event(egui::Event::Zoom(1.5));
+        h.run_steps(3);
+        assert!(h.state().views[0].zoom > zoom * 1.4, "zoom works without the prompt");
+        let page = h.state().views[0].page_screen_rect(0).expect("page on screen");
+        let at = page.min + egui::vec2(page.width() * 0.5, page.height() * 0.5);
+        h.hover_at(at);
+        h.run_steps(1);
+        h.drag_at(at);
+        h.run_steps(1);
+        h.drop_at(at);
+        h.run_steps(4);
+        assert_eq!(stamps(h.state()), 1, "a stamp is placed without the prompt");
     }
 
     #[test]
