@@ -249,7 +249,13 @@ impl PdfCraftApp {
     pub(crate) fn ask(&mut self, ask: Ask, target: Option<DocId>, then: impl FnOnce(&mut PdfCraftApp, Vec<PathBuf>) + Send + 'static) -> bool {
         let target = self.pick_target(target);
         let then: Then = Box::new(then);
-        if self.pickers.showing.swap(true, Ordering::SeqCst) {
+        let busy = self.pickers.showing.swap(true, Ordering::SeqCst);
+        // A panel that couldn't show is waiting for its answer; a new one waits behind it, as
+        // `process_picked` does (it doesn't hold `showing`, so a request could slip past it).
+        if !busy && self.pickers.failed.is_some() {
+            self.pickers.showing.store(false, Ordering::SeqCst);
+        }
+        if busy || self.pickers.failed.is_some() {
             // Refusing would drop what asked, such as a finished Reduce File Size copy.
             self.pickers.waiting.push_back(Waiting { ask, target, then });
             self.notify_tr("Another file dialog is still open. This one will open when it closes.");
@@ -522,6 +528,27 @@ mod tests {
         assert_eq!(app.picker_failed(), None);
         app.process_picked();
         assert_eq!(*got.lock().unwrap(), vec![PathBuf::from("reduced.pdf")]);
+    }
+
+    #[test]
+    fn a_new_request_waits_behind_the_open_failure_prompt() {
+        let mut app = PdfCraftApp::new();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        answer_empty(&mut app, record(&got), backend_down);
+        // The control channel can ask for a file while the prompt is up (`ui.command file.open`).
+        let other = Arc::new(Mutex::new(Vec::new()));
+        app.pick_override = Some(vec!["other.pdf".into()]);
+        assert!(app.ask(Ask::File(rfd::AsyncFileDialog::new()), None, record(&other)));
+        app.process_picked();
+        assert!(app.picker_failed().is_some(), "the prompt is still open");
+        assert!(!app.pickers.showing.load(Ordering::SeqCst), "the waiting request doesn't hold the picker");
+        assert!(other.lock().unwrap().is_empty(), "no picker showed behind the prompt");
+        // Discard the kept request: the waiting one shows.
+        app.resolve_picker_failed(false);
+        app.process_picked();
+        app.process_picked();
+        assert_eq!(*other.lock().unwrap(), vec![PathBuf::from("other.pdf")]);
+        assert!(got.lock().unwrap().is_empty(), "the discarded request never ran");
     }
 
     /// The prompt covers the page, so a stamp can't be placed and the wheel can't zoom under it
